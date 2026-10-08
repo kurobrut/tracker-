@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: roblox-presence-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: CHECK_INTERVAL
+        value: 30
