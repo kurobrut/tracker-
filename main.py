@@ -14,7 +14,6 @@ from discord import app_commands
 from fastapi import FastAPI
 import uvicorn
 
-
 # ============================================================
 # ENV
 # ============================================================
@@ -23,11 +22,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
-DISCORD_GUILD_ID = (
-    int(os.environ["DISCORD_GUILD_ID"])
-    if os.getenv("DISCORD_GUILD_ID")
-    else None
-)
+DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.getenv("DISCORD_GUILD_ID") else None
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
@@ -40,48 +35,28 @@ DISCORD_ADMIN_USER_IDS = {
     for x in os.getenv("DISCORD_ADMIN_USER_IDS", "").split(",")
     if x.strip().isdigit()
 }
-
 TELEGRAM_ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
     if x.strip().lstrip("-").isdigit()
 }
 
-
-# ============================================================
-# ROBLOX API
-# ============================================================
-
 ROBLOX_PRESENCE_URL = "https://presence.roblox.com/v1/presence/users"
-
-ROBLOX_USERS_URL = (
-    "https://users.roblox.com/v1/users/{}"
-)
-
-ROBLOX_UNIVERSE_GAMES_URL = (
-    "https://games.roblox.com/v1/games?universeIds={}"
-)
-
+ROBLOX_USERS_URL = "https://users.roblox.com/v1/users/{}"
+ROBLOX_PLACE_TO_UNIVERSE_URL = "https://apis.roblox.com/universes/v1/places/{}/universe"
+ROBLOX_UNIVERSE_GAMES_URL = "https://games.roblox.com/v1/games?universeIds={}"
 
 HTTP = requests.Session()
-
-HTTP.headers.update(
-    {
-        "User-Agent": "RobloxPresenceTracker/3.0"
-    }
-)
-
+HTTP.headers.update({"User-Agent": "RobloxPresenceTracker/2.0"})
 
 # ============================================================
-# DATABASE POOL
+# POSTGRES CONNECTION POOL
 # ============================================================
 
 DB_POOL: Optional[ThreadedConnectionPool] = None
 
-
 def init_pool():
     global DB_POOL
-
     if DB_POOL is None:
         DB_POOL = ThreadedConnectionPool(
             1,
@@ -90,112 +65,77 @@ def init_pool():
             connect_timeout=10,
         )
 
-
 def db_conn():
     if DB_POOL is None:
         init_pool()
-
     return DB_POOL.getconn()
-
 
 def db_put(conn):
     if DB_POOL is not None and conn is not None:
         DB_POOL.putconn(conn)
-
 
 # ============================================================
 # DATABASE MIGRATION
 # ============================================================
 
 def init_db():
-
+    """
+    Creates new tables and upgrades tables from older versions.
+    Safe to run on every startup.
+    """
     init_pool()
-
     conn = db_conn()
-
     try:
-
         conn.autocommit = False
-
         with conn.cursor() as cur:
-
-            # ------------------------------------------------
-            # TRACKED USERS
-            # ------------------------------------------------
-
-            cur.execute(
-                """
+            # Base tables.
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS tracked_users (
                     user_id BIGINT PRIMARY KEY,
                     label TEXT NOT NULL
                 )
-                """
-            )
-
-            cur.execute(
-                """
-                ALTER TABLE tracked_users
-                ADD COLUMN IF NOT EXISTS label TEXT
-                """
-            )
-
-            cur.execute(
-                """
-                ALTER TABLE tracked_users
-                ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ
-                """
-            )
-
-            cur.execute(
-                """
-                UPDATE tracked_users
-                SET label =
-                    COALESCE(
-                        NULLIF(label, ''),
-                        'User_' || user_id::text
-                    )
-                WHERE label IS NULL
-                   OR label = ''
-                """
-            )
-
-            cur.execute(
-                """
-                UPDATE tracked_users
-                SET added_at = NOW()
-                WHERE added_at IS NULL
-                """
-            )
-
-            cur.execute(
-                """
-                ALTER TABLE tracked_users
-                ALTER COLUMN label SET NOT NULL
-                """
-            )
-
-            cur.execute(
-                """
-                ALTER TABLE tracked_users
-                ALTER COLUMN added_at
-                SET DEFAULT NOW()
-                """
-            )
-
-
-            # ------------------------------------------------
-            # PRESENCE STATE
-            # ------------------------------------------------
-
-            cur.execute(
-                """
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS presence_state (
                     user_id BIGINT PRIMARY KEY
                 )
-                """
-            )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS place_cache (
+                    place_id BIGINT PRIMARY KEY
+                )
+            """)
 
-            presence_columns = [
+            # ---- Upgrade tracked_users from older bot versions ----
+            cur.execute("""
+                ALTER TABLE tracked_users
+                ADD COLUMN IF NOT EXISTS label TEXT
+            """)
+            cur.execute("""
+                ALTER TABLE tracked_users
+                ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                UPDATE tracked_users
+                SET label = COALESCE(NULLIF(label, ''), 'User_' || user_id::text)
+                WHERE label IS NULL OR label = ''
+            """)
+            cur.execute("""
+                UPDATE tracked_users
+                SET added_at = NOW()
+                WHERE added_at IS NULL
+            """)
+            cur.execute("""
+                ALTER TABLE tracked_users
+                ALTER COLUMN label SET NOT NULL
+            """)
+            cur.execute("""
+                ALTER TABLE tracked_users
+                ALTER COLUMN added_at SET DEFAULT NOW()
+            """)
+
+            # ---- Upgrade presence_state ----
+            additions = [
                 ("username", "TEXT"),
                 ("presence_type", "INTEGER"),
                 ("place_id", "BIGINT"),
@@ -204,562 +144,262 @@ def init_db():
                 ("game_name", "TEXT"),
                 ("checked_at", "TIMESTAMPTZ"),
             ]
-
-            for column, data_type in presence_columns:
-
-                cur.execute(
-                    f"""
+            for col, typ in additions:
+                cur.execute(f"""
                     ALTER TABLE presence_state
-                    ADD COLUMN IF NOT EXISTS
-                    {column} {data_type}
-                    """
-                )
+                    ADD COLUMN IF NOT EXISTS {col} {typ}
+                """)
 
-            cur.execute(
-                """
+            cur.execute("""
                 UPDATE presence_state
                 SET checked_at = NOW()
                 WHERE checked_at IS NULL
-                """
-            )
-
-            cur.execute(
-                """
+            """)
+            cur.execute("""
                 ALTER TABLE presence_state
-                ALTER COLUMN checked_at
-                SET DEFAULT NOW()
-                """
-            )
+                ALTER COLUMN checked_at SET DEFAULT NOW()
+            """)
 
-
-            # ------------------------------------------------
-            # PLACE CACHE
-            # ------------------------------------------------
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS place_cache (
-                    place_id BIGINT PRIMARY KEY
-                )
-                """
-            )
-
-            cache_columns = [
+            # ---- Upgrade place_cache ----
+            cache_additions = [
                 ("game_name", "TEXT"),
                 ("game_url", "TEXT"),
                 ("updated_at", "TIMESTAMPTZ"),
             ]
-
-            for column, data_type in cache_columns:
-
-                cur.execute(
-                    f"""
+            for col, typ in cache_additions:
+                cur.execute(f"""
                     ALTER TABLE place_cache
-                    ADD COLUMN IF NOT EXISTS
-                    {column} {data_type}
-                    """
-                )
+                    ADD COLUMN IF NOT EXISTS {col} {typ}
+                """)
 
-            cur.execute(
-                """
+            cur.execute("""
                 UPDATE place_cache
-                SET
-                    game_name =
-                        COALESCE(
-                            game_name,
-                            'Unknown Game'
-                        ),
-                    updated_at =
-                        COALESCE(
-                            updated_at,
-                            NOW()
-                        )
-                """
-            )
-
-            cur.execute(
-                """
+                SET game_name = COALESCE(game_name, 'Unknown Game'),
+                    updated_at = COALESCE(updated_at, NOW())
+            """)
+            cur.execute("""
                 ALTER TABLE place_cache
-                ALTER COLUMN game_name
-                SET DEFAULT 'Unknown Game'
-                """
-            )
-
-            cur.execute(
-                """
+                ALTER COLUMN game_name SET DEFAULT 'Unknown Game'
+            """)
+            cur.execute("""
                 ALTER TABLE place_cache
-                ALTER COLUMN updated_at
-                SET DEFAULT NOW()
-                """
-            )
+                ALTER COLUMN updated_at SET DEFAULT NOW()
+            """)
 
         conn.commit()
-
-        print(
-            "[Database] schema ready/migrated successfully"
-        )
-
+        print("[Database] schema ready/migrated successfully")
     except Exception:
-
         conn.rollback()
         raise
-
     finally:
-
         db_put(conn)
-
 
 # ============================================================
 # DATABASE HELPERS
 # ============================================================
 
 def get_tracked_users():
-
     conn = db_conn()
-
     try:
-
-        with conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-
-            cur.execute(
-                """
-                SELECT
-                    user_id,
-                    label
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # COALESCE makes this safe even if an old row somehow has null added_at.
+            cur.execute("""
+                SELECT user_id, label
                 FROM tracked_users
-                ORDER BY
-                    COALESCE(
-                        added_at,
-                        NOW()
-                    ) ASC,
-                    user_id ASC
-                """
-            )
-
+                ORDER BY COALESCE(added_at, NOW()) ASC, user_id ASC
+            """)
             return list(cur.fetchall())
-
     finally:
-
         db_put(conn)
 
-
-def add_tracked_user(
-    user_id: int,
-    label: str
-):
-
+def add_tracked_user(user_id: int, label: str):
     conn = db_conn()
-
     try:
-
         with conn.cursor() as cur:
-
-            cur.execute(
-                """
-                INSERT INTO tracked_users
-                    (
-                        user_id,
-                        label,
-                        added_at
-                    )
-                VALUES
-                    (
-                        %s,
-                        %s,
-                        NOW()
-                    )
-
+            cur.execute("""
+                INSERT INTO tracked_users (user_id, label, added_at)
+                VALUES (%s, %s, NOW())
                 ON CONFLICT (user_id)
-                DO UPDATE SET
-                    label = EXCLUDED.label
-                """,
-                (
-                    user_id,
-                    label,
-                ),
-            )
-
+                DO UPDATE SET label = EXCLUDED.label
+            """, (user_id, label))
         conn.commit()
-
     except Exception:
-
         conn.rollback()
         raise
-
     finally:
-
         db_put(conn)
 
-
-def remove_tracked_user(
-    user_id: int
-):
-
+def remove_tracked_user(user_id: int):
     conn = db_conn()
-
     try:
-
         with conn.cursor() as cur:
-
-            cur.execute(
-                """
-                DELETE FROM presence_state
-                WHERE user_id = %s
-                """,
-                (user_id,),
-            )
-
-            cur.execute(
-                """
-                DELETE FROM tracked_users
-                WHERE user_id = %s
-                """,
-                (user_id,),
-            )
-
+            # Explicit cleanup keeps compatibility with old schemas that may
+            # not have an ON DELETE CASCADE foreign key.
+            cur.execute("DELETE FROM presence_state WHERE user_id = %s", (user_id,))
+            cur.execute("DELETE FROM tracked_users WHERE user_id = %s", (user_id,))
             deleted = cur.rowcount > 0
-
         conn.commit()
-
         return deleted
-
     except Exception:
-
         conn.rollback()
         raise
-
     finally:
-
         db_put(conn)
 
-
-def get_all_saved_states(
-    user_ids
-):
-
+def get_all_saved_states(user_ids):
     if not user_ids:
         return {}
-
     conn = db_conn()
-
     try:
-
-        with conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-
-            cur.execute(
-                """
-                SELECT
-                    user_id,
-                    username,
-                    presence_type,
-                    place_id,
-                    universe_id,
-                    game_id,
-                    game_name,
-                    checked_at
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT user_id, username, presence_type, place_id,
+                       universe_id, game_id, game_name, checked_at
                 FROM presence_state
                 WHERE user_id = ANY(%s)
-                """,
-                (user_ids,),
-            )
-
-            return {
-                int(row["user_id"]): row
-                for row in cur.fetchall()
-            }
-
+            """, (user_ids,))
+            return {int(row["user_id"]): row for row in cur.fetchall()}
     finally:
-
         db_put(conn)
 
-
-def save_state(
-    user_id: int,
-    username: str,
-    presence_type: int,
-    place_id: Optional[int],
-    universe_id: Optional[int],
-    game_id: Optional[str],
-    game_name: Optional[str],
-):
-
+def save_state(user_id: int, username: str, presence_type: int,
+               place_id: Optional[int], game_id: Optional[str],
+               game_name: Optional[str]):
     conn = db_conn()
-
     try:
-
         with conn.cursor() as cur:
-
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO presence_state
-                    (
-                        user_id,
-                        username,
-                        presence_type,
-                        place_id,
-                        universe_id,
-                        game_id,
-                        game_name,
-                        checked_at
-                    )
-                VALUES
-                    (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        NOW()
-                    )
-
+                    (user_id, username, presence_type, place_id,
+                     game_id, game_name, checked_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (user_id)
                 DO UPDATE SET
-                    username =
-                        EXCLUDED.username,
-
-                    presence_type =
-                        EXCLUDED.presence_type,
-
-                    place_id =
-                        EXCLUDED.place_id,
-
-                    universe_id =
-                        EXCLUDED.universe_id,
-
-                    game_id =
-                        EXCLUDED.game_id,
-
-                    game_name =
-                        EXCLUDED.game_name,
-
-                    checked_at =
-                        NOW()
-                """,
-                (
-                    user_id,
-                    username,
-                    presence_type,
-                    place_id,
-                    universe_id,
-                    game_id,
-                    game_name,
-                ),
-            )
-
+                    username = EXCLUDED.username,
+                    presence_type = EXCLUDED.presence_type,
+                    place_id = EXCLUDED.place_id,
+                    universe_id = EXCLUDED.universe_id,
+                    game_id = EXCLUDED.game_id,
+                    game_name = EXCLUDED.game_name,
+                    checked_at = NOW()
+            """, (
+                user_id, username, presence_type,
+                place_id, game_id, game_name
+            ))
         conn.commit()
-
     except Exception:
-
         conn.rollback()
         raise
-
     finally:
-
         db_put(conn)
 
-
 def get_active_rows():
-
     conn = db_conn()
-
     try:
-
-        with conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-
-            cur.execute(
-                """
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
                 SELECT
                     t.user_id,
                     t.label,
-
                     p.username,
                     p.presence_type,
                     p.game_name,
                     p.place_id,
                     p.checked_at
-
                 FROM tracked_users t
-
-                LEFT JOIN presence_state p
-                ON p.user_id = t.user_id
-
-                WHERE
-                    COALESCE(
-                        p.presence_type,
-                        0
-                    ) <> 0
-
-                ORDER BY
-                    t.label ASC
-                """
-            )
-
+                LEFT JOIN presence_state p ON p.user_id = t.user_id
+                WHERE COALESCE(p.presence_type, 0) <> 0
+                ORDER BY t.label ASC
+            """)
             return list(cur.fetchall())
-
     finally:
-
         db_put(conn)
 
-
-def get_cached_game(
-    place_id
-):
-
+def get_cached_game(place_id):
     conn = db_conn()
-
     try:
-
-        with conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-
-            cur.execute(
-                """
-                SELECT
-                    game_name,
-                    game_url
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT game_name, game_url
                 FROM place_cache
                 WHERE place_id = %s
-                """,
-                (place_id,),
-            )
-
+            """, (place_id,))
             return cur.fetchone()
-
     finally:
-
         db_put(conn)
 
-
-def save_cached_game(
-    place_id,
-    game_name,
-    game_url
-):
-
+def save_cached_game(place_id, game_name, game_url):
     conn = db_conn()
-
     try:
-
         with conn.cursor() as cur:
-
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO place_cache
-                    (
-                        place_id,
-                        game_name,
-                        game_url,
-                        updated_at
-                    )
-
-                VALUES
-                    (
-                        %s,
-                        %s,
-                        %s,
-                        NOW()
-                    )
-
+                    (place_id, game_name, game_url, updated_at)
+                VALUES (%s, %s, %s, NOW())
                 ON CONFLICT (place_id)
                 DO UPDATE SET
-                    game_name =
-                        EXCLUDED.game_name,
-
-                    game_url =
-                        EXCLUDED.game_url,
-
-                    updated_at =
-                        NOW()
-                """,
-                (
-                    place_id,
-                    game_name,
-                    game_url,
-                ),
-            )
-
+                    game_name = EXCLUDED.game_name,
+                    game_url = EXCLUDED.game_url,
+                    updated_at = NOW()
+            """, (place_id, game_name, game_url))
         conn.commit()
-
     except Exception:
-
         conn.rollback()
         raise
-
     finally:
-
         db_put(conn)
 
-
 # ============================================================
-# ROBLOX HELPERS
+# ROBLOX
 # ============================================================
 
-def get_username(
-    user_id: int
-) -> str:
+def get_username(user_id: int) -> str:
+    try:
+        r = HTTP.get(ROBLOX_USERS_URL.format(user_id), timeout=6)
+        if r.ok:
+            return r.json().get("name") or f"User_{user_id}"
+    except requests.RequestException as exc:
+        print(f"[Roblox] username failed for {user_id}: {exc}")
+    return f"User_{user_id}"
+
+def get_universe_from_place(place_id: Optional[int]):
+    if not place_id:
+        return None
 
     try:
-
         response = HTTP.get(
-            ROBLOX_USERS_URL.format(
-                user_id
-            ),
-            timeout=6,
+            ROBLOX_PLACE_TO_UNIVERSE_URL.format(place_id),
+            timeout=8,
         )
 
         if response.ok:
-
             data = response.json()
-
-            return (
-                data.get("name")
-                or f"User_{user_id}"
+            universe_id = (
+                data.get("universeId")
+                or data.get("universeID")
+                or data.get("UniverseId")
             )
 
-    except requests.RequestException as exc:
+            if universe_id:
+                try:
+                    return int(universe_id)
+                except (TypeError, ValueError):
+                    pass
 
         print(
-            f"[Roblox] username failed "
-            f"for {user_id}: {exc}"
+            f"[Roblox] place -> universe failed "
+            f"placeId={place_id} "
+            f"status={response.status_code} "
+            f"response={response.text[:300]}"
         )
 
-    return f"User_{user_id}"
+    except requests.RequestException as exc:
+        print(
+            f"[Roblox] place -> universe error "
+            f"placeId={place_id}: {exc}"
+        )
 
-
-def clean_last_location(
-    value: Optional[str]
-):
-
-    if not value:
-        return None
-
-    value = value.strip()
-
-    if not value:
-        return None
-
-    ignored = {
-        "website",
-        "mobile website",
-        "studio",
-        "xbox",
-        "unknown",
-        "roblox",
-    }
-
-    if value.lower() in ignored:
-        return None
-
-    return value
+    return None
 
 
 def get_game_info(
@@ -767,216 +407,120 @@ def get_game_info(
     universe_id: Optional[int] = None,
     last_location: Optional[str] = None,
 ):
-
     """
-    Resolves the Roblox experience name.
+    Resolve the Roblox experience name without requiring a .ROBLOSECURITY cookie.
 
     Priority:
-    1. Presence API lastLocation
-    2. PostgreSQL cache
-    3. Roblox universe details API
-    4. Place ID fallback
+    1. Presence API lastLocation (often already contains the current experience name)
+    2. Cached place result
+    3. Universe details endpoint:
+       GET https://games.roblox.com/v1/games?universeIds=<id>
+       This endpoint does not require a Roblox cookie.
+    4. A readable fallback using the place id.
+
+    Roblox may hide place/universe details for some users because of their
+    presence/privacy settings. In that case there is no reliable public API
+    way to recover the hidden experience name.
     """
-
-    location_name = clean_last_location(
-        last_location
-    )
-
-
-    # --------------------------------------------------------
-    # 1. PRESENCE LAST LOCATION
-    # --------------------------------------------------------
-
-    if location_name:
-
-        game_url = None
+    # Presence often gives the experience name directly.
+    clean_location = (last_location or "").strip()
+    if clean_location and clean_location.lower() not in {
+        "website",
+        "mobile website",
+        "studio",
+        "xbox",
+        "unknown",
+    }:
+        game_url = (
+            f"https://www.roblox.com/games/{place_id}"
+            if place_id
+            else None
+        )
 
         if place_id:
+            save_cached_game(place_id, clean_location, game_url)
 
-            game_url = (
-                f"https://www.roblox.com/"
-                f"games/{place_id}"
-            )
+        return clean_location, game_url
 
-            save_cached_game(
-                place_id,
-                location_name,
-                game_url,
-            )
-
-        return (
-            location_name,
-            game_url,
-        )
-
-
-    # --------------------------------------------------------
-    # 2. CACHE
-    # --------------------------------------------------------
-
+    # Reuse cache when available.
     if place_id:
+        cached = get_cached_game(place_id)
+        if cached and cached.get("game_name") and cached["game_name"] != "Unknown Game":
+            return cached["game_name"], cached.get("game_url")
 
-        cached = get_cached_game(
-            place_id
+    # If Presence did not return universeId but did return placeId,
+    # convert Place ID -> Universe ID using Roblox's public endpoint.
+    if not universe_id and place_id:
+        universe_id = get_universe_from_place(place_id)
+        print(
+            f"[Roblox] converted placeId {place_id} "
+            f"-> universeId {universe_id}"
         )
 
-        if cached:
-
-            cached_name = cached.get(
-                "game_name"
-            )
-
-            if (
-                cached_name
-                and cached_name
-                != "Unknown Game"
-            ):
-
-                return (
-                    cached_name,
-                    cached.get(
-                        "game_url"
-                    ),
-                )
-
-
-    # --------------------------------------------------------
-    # 3. UNIVERSE API
-    # --------------------------------------------------------
-
+    # Presence can provide universeId, or we may have resolved it from placeId.
+    # Use Roblox's public game-details API.
     if universe_id:
-
         try:
-
-            response = HTTP.get(
-                ROBLOX_UNIVERSE_GAMES_URL.format(
-                    universe_id
-                ),
+            r = HTTP.get(
+                ROBLOX_UNIVERSE_GAMES_URL.format(universe_id),
                 timeout=6,
             )
-
-            if response.ok:
-
-                payload = response.json()
-
-                games = payload.get(
-                    "data"
-                ) or []
-
-                if games:
-
-                    game = games[0]
-
-                    game_name = (
-                        game.get("name")
-                        or "Unknown Game"
+            if r.ok:
+                payload = r.json()
+                items = payload.get("data") or []
+                if items:
+                    info = items[0]
+                    game_name = info.get("name") or clean_location or "Unknown Game"
+                    root_place_id = info.get("rootPlaceId") or place_id
+                    game_url = (
+                        f"https://www.roblox.com/games/{root_place_id}"
+                        if root_place_id
+                        else None
                     )
-
-                    root_place_id = (
-                        game.get(
-                            "rootPlaceId"
-                        )
-                        or place_id
-                    )
-
-                    game_url = None
-
-                    if root_place_id:
-
-                        game_url = (
-                            "https://www.roblox.com/"
-                            f"games/{root_place_id}"
-                        )
 
                     if place_id:
+                        save_cached_game(place_id, game_name, game_url)
 
-                        save_cached_game(
-                            place_id,
-                            game_name,
-                            game_url,
-                        )
-
-                    return (
-                        game_name,
-                        game_url,
-                    )
-
+                    return game_name, game_url
             else:
-
                 print(
-                    "[Roblox] universe lookup "
-                    f"failed {response.status_code}: "
-                    f"{response.text[:200]}"
+                    f"[Roblox] universe lookup failed "
+                    f"{r.status_code}: {r.text[:200]}"
                 )
-
         except requests.RequestException as exc:
-
             print(
-                "[Roblox] universe lookup failed "
-                f"for {universe_id}: {exc}"
+                f"[Roblox] universe lookup failed for "
+                f"{universe_id}: {exc}"
             )
 
-
-    # --------------------------------------------------------
-    # 4. FALLBACK
-    # --------------------------------------------------------
-
+    # If Roblox exposes a place id but hides the universe/name, retain a useful
+    # link rather than claiming the game name is known.
     if place_id:
-
         return (
-            f"Roblox Experience "
-            f"(Place {place_id})",
-
-            f"https://www.roblox.com/"
-            f"games/{place_id}",
+            f"Roblox Experience (Place {place_id})",
+            f"https://www.roblox.com/games/{place_id}",
         )
 
+    return "Unknown Game", None
 
-    return (
-        "Unknown Game",
-        None,
-    )
-
-
-def fetch_presences(
-    user_ids
-):
-
+def fetch_presences(user_ids):
     if not user_ids:
         return {}
 
     try:
-
-        response = HTTP.post(
+        r = HTTP.post(
             ROBLOX_PRESENCE_URL,
-            json={
-                "userIds": user_ids
-            },
+            json={"userIds": user_ids},
             timeout=10,
         )
-
-        response.raise_for_status()
-
-        data = response.json()
-
+        r.raise_for_status()
         return {
             int(item["userId"]): item
-            for item
-            in data.get(
-                "userPresences",
-                []
-            )
+            for item in r.json().get("userPresences", [])
         }
-
     except requests.RequestException as exc:
-
-        print(
-            "[Roblox] presence request "
-            f"failed: {exc}"
-        )
-
+        print(f"[Roblox] presence request failed: {exc}")
         return {}
-
 
 # ============================================================
 # CHANGE DETECTION
@@ -992,227 +536,72 @@ def build_change_message(
     old_game_name,
     server_changed,
 ):
-
-    new_type = int(
-        new_presence_type
-    )
-
+    new_type = int(new_presence_type)
     old_type = None
+    if old and old.get("presence_type") is not None:
+        old_type = int(old["presence_type"])
 
-    if (
-        old
-        and old.get(
-            "presence_type"
-        ) is not None
-    ):
+    display = username if label.lower() == username.lower() else f"{label} ({username})"
 
-        old_type = int(
-            old["presence_type"]
-        )
-
-    if (
-        label.lower()
-        == username.lower()
-    ):
-
-        display = username
-
-    else:
-
-        display = (
-            f"{label} "
-            f"({username})"
-        )
-
-
-    # --------------------------------------------------------
-    # FIRST SNAPSHOT
-    # --------------------------------------------------------
-
+    # First snapshot after /track.
     if old is None:
-
         if new_type in (2, 3):
-
-            description = (
-                f"**{display}** is currently "
-                f"playing **"
-                f"{game_name or 'Unknown Game'}"
-                f"**"
-            )
-
-            if game_url:
-
-                description += (
-                    f"\n{game_url}"
-                )
-
             return (
                 "🎮 Current Status",
-                description,
+                f"**{display}** is currently playing **{game_name or 'Unknown Game'}**"
+                + (f"\n{game_url}" if game_url else ""),
             )
-
         if new_type == 1:
+            return "🟢 Current Status", f"**{display}** is currently online."
+        return "🔴 Current Status", f"**{display}** is currently offline."
 
-            return (
-                "🟢 Current Status",
-                f"**{display}** "
-                f"is currently online.",
-            )
-
-        return (
-            "🔴 Current Status",
-            f"**{display}** "
-            f"is currently offline.",
-        )
-
-
-    # --------------------------------------------------------
-    # SAME HIGH-LEVEL PRESENCE
-    # --------------------------------------------------------
-
+    # Same high-level presence state.
     if old_type == new_type:
-
         if new_type in (2, 3):
-
-            if (
-                old_game_name
-                and game_name
-                and old_game_name
-                != game_name
-            ):
-
-                description = (
-                    f"**{display}** switched "
-                    f"from **{old_game_name}** "
-                    f"to **{game_name}**"
-                )
-
-                if game_url:
-
-                    description += (
-                        f"\n{game_url}"
-                    )
-
+            if old_game_name and game_name and old_game_name != game_name:
                 return (
                     "🔄 Switched Game",
-                    description,
+                    f"**{display}** switched from **{old_game_name}** to **{game_name}**"
+                    + (f"\n{game_url}" if game_url else ""),
                 )
-
             if server_changed:
-
-                description = (
-                    f"**{display}** changed "
-                    f"servers in **"
-                    f"{game_name or 'Unknown Game'}"
-                    f"**"
-                )
-
-                if game_url:
-
-                    description += (
-                        f"\n{game_url}"
-                    )
-
                 return (
                     "🔁 Changed Server",
-                    description,
+                    f"**{display}** changed servers in **{game_name or 'Unknown Game'}**"
+                    + (f"\n{game_url}" if game_url else ""),
                 )
-
         return None
 
-
-    # --------------------------------------------------------
-    # OFFLINE
-    # --------------------------------------------------------
-
     if new_type == 0:
-
-        return (
-            "🔴 Went Offline",
-            f"**{display}** went offline.",
-        )
-
-
-    # --------------------------------------------------------
-    # ONLINE BUT NOT PLAYING
-    # --------------------------------------------------------
+        return "🔴 Went Offline", f"**{display}** went offline."
 
     if new_type == 1:
-
         if old_type in (2, 3):
-
-            return (
-                "🟢 Left Game",
-                f"**{display}** left the game "
-                f"but is still online.",
-            )
-
-        return (
-            "🟢 Came Online",
-            f"**{display}** came online.",
-        )
-
-
-    # --------------------------------------------------------
-    # PLAYING
-    # --------------------------------------------------------
+            return "🟢 Left Game", f"**{display}** left the game but is still online."
+        return "🟢 Came Online", f"**{display}** came online."
 
     if new_type in (2, 3):
-
-        title = (
-            "🎮 Started Playing"
-        )
-
+        title = "🎮 Started Playing"
         if old_type == 0:
-
-            title = (
-                "🎮 Came Online & "
-                "Started Playing"
-            )
-
-        description = (
-            f"**{display}** is playing "
-            f"**"
-            f"{game_name or 'Unknown Game'}"
-            f"**"
-        )
-
-        if game_url:
-
-            description += (
-                f"\n{game_url}"
-            )
+            title = "🎮 Came Online & Started Playing"
 
         return (
             title,
-            description,
+            f"**{display}** is playing **{game_name or 'Unknown Game'}**"
+            + (f"\n{game_url}" if game_url else ""),
         )
 
     return None
-
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-TELEGRAM_API = (
-    f"https://api.telegram.org/"
-    f"bot{TELEGRAM_BOT_TOKEN}"
-)
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-
-def telegram_send(
-    text: str,
-    chat_id: Optional[str] = None
-):
-
-    target = str(
-        chat_id
-        or TELEGRAM_CHAT_ID
-    )
-
+def telegram_send(text: str, chat_id: Optional[str] = None):
+    target = str(chat_id or TELEGRAM_CHAT_ID)
     try:
-
         response = HTTP.post(
             f"{TELEGRAM_API}/sendMessage",
             json={
@@ -1223,563 +612,221 @@ def telegram_send(
             },
             timeout=10,
         )
-
         if not response.ok:
-
             print(
-                "[Telegram] sendMessage failed "
-                f"{response.status_code}: "
-                f"{response.text[:300]}"
+                f"[Telegram] sendMessage failed "
+                f"{response.status_code}: {response.text[:300]}"
             )
-
     except requests.RequestException as exc:
+        print(f"[Telegram] send failed: {exc}")
 
-        print(
-            f"[Telegram] send failed: {exc}"
-        )
-
-
-def telegram_authorized(
-    user_id: int
-):
-
-    return (
-        not TELEGRAM_ADMIN_IDS
-        or user_id in TELEGRAM_ADMIN_IDS
-    )
-
+def telegram_authorized(user_id: int):
+    return not TELEGRAM_ADMIN_IDS or user_id in TELEGRAM_ADMIN_IDS
 
 def telegram_active_text():
-
     rows = get_active_rows()
-
     if not rows:
+        return "No tracked players are currently active."
 
-        return (
-            "No tracked players "
-            "are currently active."
-        )
-
-    lines = [
-        "🟢 *Active tracked players:*"
-    ]
-
+    lines = ["🟢 *Active tracked players:*"]
     for row in rows:
-
-        username = (
-            row["username"]
-            or f"User_{row['user_id']}"
-        )
-
+        username = row["username"] or f"User_{row['user_id']}"
         if row["presence_type"] in (2, 3):
-
             lines.append(
-                f"• {row['label']} "
-                f"({username}) — 🎮 "
+                f"• {row['label']} ({username}) — 🎮 "
                 f"{row['game_name'] or 'Unknown Game'}"
             )
-
         else:
-
-            lines.append(
-                f"• {row['label']} "
-                f"({username}) — 🟢 Online"
-            )
-
-    return "\n".join(
-        lines
-    )
-
+            lines.append(f"• {row['label']} ({username}) — 🟢 Online")
+    return "\n".join(lines)
 
 def telegram_tracked_text():
-
     users = get_tracked_users()
-
     if not users:
+        return "No tracked Roblox users."
 
-        return (
-            "No tracked Roblox users."
-        )
-
-    return (
-        "📋 *Tracked users:*\n"
-        + "\n".join(
-            f"• {u['label']} — "
-            f"`{u['user_id']}`"
-            for u in users
-        )
+    return "📋 *Tracked users:*\n" + "\n".join(
+        f"• {u['label']} — `{u['user_id']}`"
+        for u in users
     )
 
-
-def telegram_polling_loop(
-    discord_loop
-):
-
+def telegram_polling_loop(discord_loop):
     offset = 0
-
-    print(
-        "[Telegram] polling started"
-    )
+    print("[Telegram] polling started")
 
     while True:
-
         try:
-
-            response = HTTP.get(
+            r = HTTP.get(
                 f"{TELEGRAM_API}/getUpdates",
                 params={
                     "timeout": 25,
                     "offset": offset,
-                    "allowed_updates":
-                        '["message"]',
+                    "allowed_updates": '["message"]',
                 },
                 timeout=35,
             )
 
-            if not response.ok:
-
+            if not r.ok:
                 print(
-                    "[Telegram] getUpdates "
-                    f"failed "
-                    f"{response.status_code}: "
-                    f"{response.text[:300]}"
+                    f"[Telegram] getUpdates failed "
+                    f"{r.status_code}: {r.text[:300]}"
                 )
-
                 time.sleep(5)
-
                 continue
 
-
-            updates = (
-                response
-                .json()
-                .get(
-                    "result",
-                    []
-                )
-            )
-
+            updates = r.json().get("result", [])
 
             for update in updates:
+                offset = update["update_id"] + 1
 
-                offset = (
-                    update["update_id"]
-                    + 1
-                )
+                message = update.get("message") or {}
+                text = (message.get("text") or "").strip()
+                chat = message.get("chat") or {}
+                sender = message.get("from") or {}
 
-                message = (
-                    update.get("message")
-                    or {}
-                )
+                chat_id = str(chat.get("id"))
+                sender_id = int(sender.get("id", 0))
 
-                text = (
-                    message
-                    .get("text")
-                    or ""
-                ).strip()
-
-                chat = (
-                    message.get("chat")
-                    or {}
-                )
-
-                sender = (
-                    message.get("from")
-                    or {}
-                )
-
-                chat_id = str(
-                    chat.get("id")
-                )
-
-                sender_id = int(
-                    sender.get(
-                        "id",
-                        0
-                    )
-                )
-
-
-                if (
-                    TELEGRAM_CHAT_ID
-                    and chat_id
-                    != str(
-                        TELEGRAM_CHAT_ID
-                    )
-                ):
-
+                if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
                     continue
 
-
-                if not text.startswith(
-                    "/"
-                ):
-
+                if not text.startswith("/"):
                     continue
 
-
-                command, *args = (
-                    text.split()
-                )
-
-                command = (
-                    command
-                    .split(
-                        "@",
-                        1
-                    )[0]
-                    .lower()
-                )
-
-
-                # --------------------------------------------
-                # START
-                # --------------------------------------------
+                command, *args = text.split()
+                command = command.split("@", 1)[0].lower()
 
                 if command == "/start":
-
                     telegram_send(
-                        "✅ Roblox Presence "
-                        "Tracker is online.\n\n"
-
-                        "/active - active users\n"
-                        "/tracked - tracked users\n"
-                        "/check - check now\n"
-
-                        "/track <user_id> [label]\n"
-                        "/untrack <user_id>",
+                        "✅ Roblox Presence Tracker is online.\n\n"
+                        "/active - active tracked users\n"
+                        "/tracked - all tracked users\n"
+                        "/check - run a check now\n"
+                        "/track <roblox_user_id> [label]\n"
+                        "/untrack <roblox_user_id>",
                         chat_id,
                     )
-
-
-                # --------------------------------------------
-                # ACTIVE
-                # --------------------------------------------
 
                 elif command == "/active":
-
-                    telegram_send(
-                        telegram_active_text(),
-                        chat_id,
-                    )
-
-
-                # --------------------------------------------
-                # TRACKED
-                # --------------------------------------------
+                    telegram_send(telegram_active_text(), chat_id)
 
                 elif command == "/tracked":
-
-                    telegram_send(
-                        telegram_tracked_text(),
-                        chat_id,
-                    )
-
-
-                # --------------------------------------------
-                # CHECK
-                # --------------------------------------------
+                    telegram_send(telegram_tracked_text(), chat_id)
 
                 elif command == "/check":
-
-                    if not telegram_authorized(
-                        sender_id
-                    ):
-
-                        telegram_send(
-                            "❌ Not authorized.",
-                            chat_id,
-                        )
-
+                    if not telegram_authorized(sender_id):
+                        telegram_send("❌ Not authorized.", chat_id)
                         continue
 
-
-                    future = (
-                        asyncio
-                        .run_coroutine_threadsafe(
-                            run_presence_check(
-                                "telegram"
-                            ),
-                            discord_loop,
-                        )
+                    future = asyncio.run_coroutine_threadsafe(
+                        run_presence_check("telegram"),
+                        discord_loop,
                     )
-
 
                     try:
-
-                        result = (
-                            future.result(
-                                timeout=30
-                            )
-                        )
-
+                        result = future.result(timeout=30)
                         telegram_send(
-                            "✅ Check complete\n"
-                            f"Checked: "
-                            f"{result['checked']}\n"
-                            f"Changes: "
-                            f"{result['changed']}",
+                            f"✅ Check complete\n"
+                            f"Checked: {result['checked']}\n"
+                            f"Changes: {result['changed']}",
                             chat_id,
                         )
-
                     except Exception as exc:
-
-                        telegram_send(
-                            f"❌ Check failed: "
-                            f"{exc}",
-                            chat_id,
-                        )
-
-
-                # --------------------------------------------
-                # TRACK
-                # --------------------------------------------
+                        telegram_send(f"❌ Check failed: {exc}", chat_id)
 
                 elif command == "/track":
-
-                    if not telegram_authorized(
-                        sender_id
-                    ):
-
-                        telegram_send(
-                            "❌ Not authorized.",
-                            chat_id,
-                        )
-
+                    if not telegram_authorized(sender_id):
+                        telegram_send("❌ Not authorized.", chat_id)
                         continue
 
-
-                    if (
-                        not args
-                        or not args[0].isdigit()
-                    ):
-
+                    if not args or not args[0].isdigit():
                         telegram_send(
-                            "Usage:\n"
-                            "/track "
-                            "<roblox_user_id> "
-                            "[label]",
+                            "Usage:\n/track <roblox_user_id> [label]",
                             chat_id,
                         )
-
                         continue
 
-
-                    uid = int(
-                        args[0]
-                    )
-
-                    username = (
-                        get_username(
-                            uid
-                        )
-                    )
-
-                    label = (
-                        " ".join(
-                            args[1:]
-                        ).strip()
-                        or username
-                    )
-
-
-                    add_tracked_user(
-                        uid,
-                        label,
-                    )
-
-
+                    uid = int(args[0])
+                    username = get_username(uid)
+                    label = " ".join(args[1:]).strip() or username
+                    add_tracked_user(uid, label)
                     telegram_send(
-                        f"✅ Tracking "
-                        f"{label} "
-                        f"({username}) "
-                        f"— {uid}",
+                        f"✅ Tracking {label} ({username}) — {uid}",
                         chat_id,
                     )
-
-
-                # --------------------------------------------
-                # UNTRACK
-                # --------------------------------------------
 
                 elif command == "/untrack":
-
-                    if not telegram_authorized(
-                        sender_id
-                    ):
-
-                        telegram_send(
-                            "❌ Not authorized.",
-                            chat_id,
-                        )
-
+                    if not telegram_authorized(sender_id):
+                        telegram_send("❌ Not authorized.", chat_id)
                         continue
 
-
-                    if (
-                        not args
-                        or not args[0].isdigit()
-                    ):
-
+                    if not args or not args[0].isdigit():
                         telegram_send(
-                            "Usage:\n"
-                            "/untrack "
-                            "<roblox_user_id>",
+                            "Usage:\n/untrack <roblox_user_id>",
                             chat_id,
                         )
-
                         continue
 
-
-                    removed = (
-                        remove_tracked_user(
-                            int(
-                                args[0]
-                            )
-                        )
-                    )
-
-
+                    removed = remove_tracked_user(int(args[0]))
                     telegram_send(
-                        (
-                            "✅ Removed."
-                            if removed
-                            else
-                            "User is not tracked."
-                        ),
+                        "✅ Removed." if removed else "User is not tracked.",
                         chat_id,
                     )
 
-
         except Exception as exc:
-
-            print(
-                "[Telegram] polling error: "
-                f"{exc}"
-            )
-
+            print(f"[Telegram] polling error: {exc}")
             time.sleep(5)
-
 
 # ============================================================
 # DISCORD
 # ============================================================
 
 intents = discord.Intents.default()
-
-client = discord.Client(
-    intents=intents
-)
-
-tree = app_commands.CommandTree(
-    client
-)
-
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 _tracker_task = None
-
 _ready_once = False
 
-
-def discord_admin(
-    interaction: discord.Interaction
-):
-
+def discord_admin(interaction: discord.Interaction):
     if DISCORD_ADMIN_USER_IDS:
+        return interaction.user.id in DISCORD_ADMIN_USER_IDS
 
-        return (
-            interaction.user.id
-            in DISCORD_ADMIN_USER_IDS
-        )
-
-
-    perms = getattr(
-        interaction.user,
-        "guild_permissions",
-        None,
-    )
-
-    return bool(
-        perms
-        and perms.manage_guild
-    )
-
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.manage_guild)
 
 async def get_discord_channel():
-
-    channel = client.get_channel(
-        DISCORD_CHANNEL_ID
-    )
-
+    channel = client.get_channel(DISCORD_CHANNEL_ID)
     if channel is not None:
         return channel
 
-
     try:
-
-        return await client.fetch_channel(
-            DISCORD_CHANNEL_ID
-        )
-
+        return await client.fetch_channel(DISCORD_CHANNEL_ID)
     except Exception as exc:
-
-        print(
-            "[Discord] fetch channel "
-            f"failed: {exc}"
-        )
-
+        print(f"[Discord] fetch channel failed: {exc}")
         return None
 
-
-async def notify_both(
-    title,
-    description
-):
-
-    channel = (
-        await get_discord_channel()
-    )
-
+async def notify_both(title, description):
+    channel = await get_discord_channel()
 
     if channel:
-
         try:
-
-            embed = discord.Embed(
-                title=title,
-                description=description,
-                timestamp=datetime.now(
-                    timezone.utc
-                ),
-            )
-
-
             await channel.send(
-                embed=embed
+                embed=discord.Embed(
+                    title=title,
+                    description=description,
+                    timestamp=datetime.now(timezone.utc),
+                )
             )
-
         except Exception as exc:
-
-            print(
-                "[Discord] notification "
-                f"failed: {exc}"
-            )
-
+            print(f"[Discord] notification failed: {exc}")
 
     await asyncio.to_thread(
         telegram_send,
         f"{title}\n\n{description}",
     )
 
-
-# ============================================================
-# DISCORD COMMANDS
-# ============================================================
-
-@tree.command(
-    name="track",
-    description="Track a Roblox user",
-)
+@tree.command(name="track", description="Track a Roblox user")
 @app_commands.describe(
     user_id="Roblox user ID",
     label="Optional display name",
@@ -1789,311 +836,155 @@ async def track_command(
     user_id: str,
     label: Optional[str] = None,
 ):
+    # Acknowledge immediately so Discord never times out while Roblox/DB runs.
+    await interaction.response.defer(ephemeral=True)
 
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-
-    if not discord_admin(
-        interaction
-    ):
-
+    if not discord_admin(interaction):
         await interaction.followup.send(
             "❌ You are not authorized.",
             ephemeral=True,
         )
-
         return
-
 
     if not user_id.isdigit():
-
         await interaction.followup.send(
-            "❌ Roblox user_id "
-            "must be numeric.",
+            "❌ Roblox user_id must be numeric.",
             ephemeral=True,
         )
-
         return
 
+    uid = int(user_id)
+    username = await asyncio.to_thread(get_username, uid)
+    final_label = (label or username).strip()
 
-    uid = int(
-        user_id
-    )
-
-
-    username = (
-        await asyncio.to_thread(
-            get_username,
-            uid,
-        )
-    )
-
-
-    final_label = (
-        label
-        or username
-    ).strip()
-
-
-    await asyncio.to_thread(
-        add_tracked_user,
-        uid,
-        final_label,
-    )
-
+    await asyncio.to_thread(add_tracked_user, uid, final_label)
 
     await interaction.followup.send(
-        f"✅ Tracking "
-        f"**{final_label}** "
-        f"({username}) — "
-        f"`{uid}`",
+        f"✅ Tracking **{final_label}** ({username}) — `{uid}`",
         ephemeral=True,
     )
 
-
-@tree.command(
-    name="untrack",
-    description="Stop tracking a Roblox user",
-)
+@tree.command(name="untrack", description="Stop tracking a Roblox user")
 async def untrack_command(
     interaction: discord.Interaction,
     user_id: str,
 ):
+    await interaction.response.defer(ephemeral=True)
 
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-
-    if not discord_admin(
-        interaction
-    ):
-
+    if not discord_admin(interaction):
         await interaction.followup.send(
             "❌ You are not authorized.",
             ephemeral=True,
         )
-
         return
-
 
     if not user_id.isdigit():
-
         await interaction.followup.send(
-            "❌ Roblox user_id "
-            "must be numeric.",
+            "❌ Roblox user_id must be numeric.",
             ephemeral=True,
         )
-
         return
 
-
-    removed = (
-        await asyncio.to_thread(
-            remove_tracked_user,
-            int(user_id),
-        )
+    removed = await asyncio.to_thread(
+        remove_tracked_user,
+        int(user_id),
     )
 
-
     await interaction.followup.send(
-        (
-            "✅ Removed."
-            if removed
-            else
-            "That user was not tracked."
-        ),
+        "✅ Removed."
+        if removed
+        else "That user was not tracked.",
         ephemeral=True,
     )
 
+@tree.command(name="tracked", description="List tracked Roblox users")
+async def tracked_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
 
-@tree.command(
-    name="tracked",
-    description="List tracked Roblox users",
-)
-async def tracked_command(
-    interaction: discord.Interaction
-):
-
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-
-    users = (
-        await asyncio.to_thread(
-            get_tracked_users
-        )
-    )
-
+    users = await asyncio.to_thread(get_tracked_users)
 
     if not users:
-
         await interaction.followup.send(
             "No tracked Roblox users.",
             ephemeral=True,
         )
-
         return
 
-
     text = "\n".join(
-        f"• **{u['label']}** — "
-        f"`{u['user_id']}`"
-
+        f"• **{u['label']}** — `{u['user_id']}`"
         for u in users
     )
-
 
     await interaction.followup.send(
         text[:1900],
         ephemeral=True,
     )
 
-
 @tree.command(
     name="active",
-    description=(
-        "Show tracked players "
-        "currently online or playing"
-    ),
+    description="Show tracked players currently online or playing",
 )
-async def active_command(
-    interaction: discord.Interaction
-):
-
+async def active_command(interaction: discord.Interaction):
     await interaction.response.defer()
 
-
-    rows = (
-        await asyncio.to_thread(
-            get_active_rows
-        )
-    )
-
+    rows = await asyncio.to_thread(get_active_rows)
 
     if not rows:
-
         await interaction.followup.send(
-            "No tracked players "
-            "are currently active."
+            "No tracked players are currently active."
         )
-
         return
 
-
     lines = []
-
-
     for row in rows:
+        username = row["username"] or f"User_{row['user_id']}"
 
-        username = (
-            row["username"]
-            or f"User_{row['user_id']}"
-        )
-
-
-        if (
-            row["presence_type"]
-            in (2, 3)
-        ):
-
+        if row["presence_type"] in (2, 3):
             lines.append(
-                f"🎮 **{row['label']}** "
-                f"({username}) — "
+                f"🎮 **{row['label']}** ({username}) — "
                 f"{row['game_name'] or 'Unknown Game'}"
             )
-
         else:
-
             lines.append(
-                f"🟢 **{row['label']}** "
-                f"({username}) — Online"
+                f"🟢 **{row['label']}** ({username}) — Online"
             )
 
+    await interaction.followup.send("\n".join(lines)[:1900])
 
-    await interaction.followup.send(
-        "\n".join(
-            lines
-        )[:1900]
-    )
+@tree.command(name="check", description="Run a presence check now")
+async def check_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
 
-
-@tree.command(
-    name="check",
-    description="Run a presence check now",
-)
-async def check_command(
-    interaction: discord.Interaction
-):
-
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-
-    if not discord_admin(
-        interaction
-    ):
-
+    if not discord_admin(interaction):
         await interaction.followup.send(
             "❌ You are not authorized.",
             ephemeral=True,
         )
-
         return
 
-
     try:
-
-        result = (
-            await run_presence_check(
-                "discord"
-            )
-        )
-
-
+        result = await run_presence_check("discord")
         await interaction.followup.send(
-            f"✅ Checked "
-            f"**{result['checked']}** "
-            f"players.\n"
-            f"Changes: "
-            f"**{result['changed']}**",
+            f"✅ Checked **{result['checked']}** players.\n"
+            f"Changes: **{result['changed']}**",
             ephemeral=True,
         )
-
-
     except Exception as exc:
-
         await interaction.followup.send(
-            f"❌ Check failed: "
-            f"`{exc}`",
+            f"❌ Check failed: `{exc}`",
             ephemeral=True,
         )
-
-
-# ============================================================
-# DISCORD READY
-# ============================================================
 
 @client.event
 async def on_ready():
-
-    global _tracker_task
-    global _ready_once
-
+    global _tracker_task, _ready_once
 
     print(
-        "[Discord] Logged in as "
-        f"{client.user} "
-        f"({client.user.id})"
+        f"[Discord] Logged in as "
+        f"{client.user} ({client.user.id})"
     )
 
-
     try:
-
         await client.change_presence(
             status=discord.Status.online,
             activity=discord.Activity(
@@ -2101,66 +992,26 @@ async def on_ready():
                 name="Roblox players",
             ),
         )
-
     except Exception as exc:
-
-        print(
-            "[Discord] presence set "
-            f"failed: {exc}"
-        )
-
+        print(f"[Discord] presence set failed: {exc}")
 
     if not _ready_once:
-
         try:
-
             if DISCORD_GUILD_ID:
-
-                guild = discord.Object(
-                    id=DISCORD_GUILD_ID
-                )
-
-                tree.copy_global_to(
-                    guild=guild
-                )
-
-                synced = await tree.sync(
-                    guild=guild
-                )
-
+                guild = discord.Object(id=DISCORD_GUILD_ID)
+                tree.copy_global_to(guild=guild)
+                synced = await tree.sync(guild=guild)
             else:
-
                 synced = await tree.sync()
 
-
-            print(
-                "[Discord] synced "
-                f"{len(synced)} commands"
-            )
-
-
+            print(f"[Discord] synced {len(synced)} commands")
         except Exception as exc:
+            print(f"[Discord] command sync failed: {exc}")
 
-            print(
-                "[Discord] command sync "
-                f"failed: {exc}"
-            )
-
-
-        if (
-            _tracker_task is None
-            or _tracker_task.done()
-        ):
-
-            _tracker_task = (
-                asyncio.create_task(
-                    tracker_loop()
-                )
-            )
-
+        if _tracker_task is None or _tracker_task.done():
+            _tracker_task = asyncio.create_task(tracker_loop())
 
         _ready_once = True
-
 
 # ============================================================
 # TRACKER
@@ -2168,374 +1019,145 @@ async def on_ready():
 
 _check_lock = asyncio.Lock()
 
-
-async def run_presence_check(
-    source="timer"
-):
-
+async def run_presence_check(source="timer"):
     async with _check_lock:
-
-        users = (
-            await asyncio.to_thread(
-                get_tracked_users
-            )
-        )
-
+        users = await asyncio.to_thread(get_tracked_users)
 
         if not users:
+            print("[Tracker] no tracked users")
+            return {"checked": 0, "changed": 0}
 
-            print(
-                "[Tracker] no tracked users"
-            )
+        user_ids = [int(u["user_id"]) for u in users]
 
-            return {
-                "checked": 0,
-                "changed": 0,
-            }
-
-
-        user_ids = [
-            int(
-                user["user_id"]
-            )
-            for user in users
-        ]
-
-
-        # ----------------------------------------------------
-        # LOAD OLD STATES ONCE
-        # ----------------------------------------------------
-
-        old_states = (
-            await asyncio.to_thread(
-                get_all_saved_states,
-                user_ids,
-            )
+        # One database query for all previous states.
+        old_states = await asyncio.to_thread(
+            get_all_saved_states,
+            user_ids,
         )
 
-
-        # ----------------------------------------------------
-        # ROBLOX PRESENCE REQUEST
-        # ----------------------------------------------------
-
-        presence_map = (
-            await asyncio.to_thread(
-                fetch_presences,
-                user_ids,
-            )
+        # One Roblox presence request for all users.
+        presence_map = await asyncio.to_thread(
+            fetch_presences,
+            user_ids,
         )
-
 
         changed = 0
         actually_checked = 0
 
-
         for user in users:
-
-            uid = int(
-                user["user_id"]
-            )
-
+            uid = int(user["user_id"])
             label = user["label"]
 
+            presence = presence_map.get(uid)
 
-            presence = (
-                presence_map.get(
-                    uid
-                )
-            )
-
-
+            # Do not falsely mark offline if Roblox omitted the account.
             if presence is None:
-
-                print(
-                    "[Tracker] Roblox omitted "
-                    f"user {uid}; skipping"
-                )
-
+                print(f"[Tracker] Roblox omitted user {uid}; skipping")
                 continue
-
 
             actually_checked += 1
 
-
             presence_type = int(
-                presence.get(
-                    "userPresenceType"
-                )
-                or 0
+                presence.get("userPresenceType") or 0
             )
-
-
-            place_id = (
-                presence.get(
-                    "placeId"
-                )
-            )
-
-
-            universe_id = (
-                presence.get(
-                    "universeId"
-                )
-            )
-
-
-            game_id = (
-                presence.get(
-                    "gameId"
-                )
-            )
-
-
-            last_location = (
-                presence.get(
-                    "lastLocation"
-                )
-                or ""
-            ).strip()
-
-
-            # ------------------------------------------------
-            # NORMALIZE IDS
-            # ------------------------------------------------
+            place_id = presence.get("placeId")
+            game_id = presence.get("gameId")
+            universe_id = presence.get("universeId")
+            last_location = (presence.get("lastLocation") or "").strip()
 
             try:
-
-                place_id = (
-                    int(place_id)
-                    if place_id
-                    else None
-                )
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
+                place_id = int(place_id) if place_id else None
+            except (TypeError, ValueError):
                 place_id = None
 
-
             try:
-
-                universe_id = (
-                    int(universe_id)
-                    if universe_id
-                    else None
-                )
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
+                universe_id = int(universe_id) if universe_id else None
+            except (TypeError, ValueError):
                 universe_id = None
 
-
-            # ------------------------------------------------
-            # OLD STATE
-            # ------------------------------------------------
-
-            old = (
-                old_states.get(
-                    uid
-                )
-            )
-
-
-            # ------------------------------------------------
-            # DEBUG CURRENT ROBLOX GAME DATA
-            # ------------------------------------------------
+            old = old_states.get(uid)
 
             if presence_type in (2, 3):
-
                 print(
                     f"[Roblox] {uid} in-game: "
-                    f"lastLocation="
-                    f"{last_location!r} "
+                    f"lastLocation={last_location!r} "
                     f"placeId={place_id} "
                     f"universeId={universe_id} "
                     f"gameId={game_id}"
                 )
 
-
-            # ------------------------------------------------
-            # USERNAME
-            # ------------------------------------------------
-
-            username = None
-
-
-            if old:
-
-                username = (
-                    old.get(
-                        "username"
-                    )
-                )
-
-
+            # Reuse username from DB after the first lookup.
+            username = (
+                old.get("username")
+                if old and old.get("username")
+                else None
+            )
             if not username:
-
-                username = (
-                    await asyncio.to_thread(
-                        get_username,
-                        uid,
-                    )
+                username = await asyncio.to_thread(
+                    get_username,
+                    uid,
                 )
-
-
-            # ------------------------------------------------
-            # GAME INFO
-            # ------------------------------------------------
 
             game_name = None
             game_url = None
 
-
-            if (
-                presence_type in (2, 3)
-            ):
-
-                game_name, game_url = (
-                    await asyncio.to_thread(
-                        get_game_info,
-                        place_id,
-                        universe_id,
-                        last_location,
-                    )
+            if presence_type in (2, 3) and place_id:
+                game_name, game_url = await asyncio.to_thread(
+                    get_game_info,
+                    place_id,
+                    universe_id,
+                    last_location,
                 )
-
-
-            # ------------------------------------------------
-            # OLD GAME
-            # ------------------------------------------------
 
             old_game_name = (
-                old.get(
-                    "game_name"
-                )
+                old.get("game_name")
                 if old
                 else None
             )
-
-
             old_game_id = (
-                old.get(
-                    "game_id"
-                )
+                old.get("game_id")
                 if old
                 else None
             )
-
-
-            # ------------------------------------------------
-            # SERVER CHANGE
-            # ------------------------------------------------
 
             server_changed = bool(
-
                 old
-
                 and presence_type in (2, 3)
-
-                and int(
-                    old.get(
-                        "presence_type"
-                    )
-                    or 0
-                )
-                in (2, 3)
-
-                and old.get(
-                    "place_id"
-                )
-                == place_id
-
+                and int(old.get("presence_type") or 0) in (2, 3)
+                and old.get("place_id") == place_id
                 and old_game_id
-
                 and game_id
-
-                and str(
-                    old_game_id
-                )
-                != str(
-                    game_id
-                )
+                and str(old_game_id) != str(game_id)
             )
 
-
-            # ------------------------------------------------
-            # BUILD NOTIFICATION
-            # ------------------------------------------------
-
-            change = (
-                build_change_message(
-
-                    label=label,
-
-                    username=username,
-
-                    old=old,
-
-                    new_presence_type=
-                        presence_type,
-
-                    game_name=
-                        game_name,
-
-                    game_url=
-                        game_url,
-
-                    old_game_name=
-                        old_game_name,
-
-                    server_changed=
-                        server_changed,
-                )
+            change = build_change_message(
+                label=label,
+                username=username,
+                old=old,
+                new_presence_type=presence_type,
+                game_name=game_name,
+                game_url=game_url,
+                old_game_name=old_game_name,
+                server_changed=server_changed,
             )
-
-
-            # ------------------------------------------------
-            # SAVE CURRENT STATE
-            # ------------------------------------------------
 
             await asyncio.to_thread(
                 save_state,
-
                 uid,
-
                 username,
-
                 presence_type,
-
                 place_id,
-
                 universe_id,
-
-                (
-                    str(game_id)
-                    if game_id
-                    else None
-                ),
-
+                str(game_id) if game_id else None,
                 game_name,
             )
 
-
-            # ------------------------------------------------
-            # SEND
-            # ------------------------------------------------
-
             if change:
-
                 changed += 1
-
                 await notify_both(
                     change[0],
                     change[1],
                 )
-
 
         print(
             f"[Tracker] source={source} "
@@ -2543,101 +1165,51 @@ async def run_presence_check(
             f"changed={changed}"
         )
 
-
         return {
-            "checked":
-                actually_checked,
-
-            "changed":
-                changed,
+            "checked": actually_checked,
+            "changed": changed,
         }
 
-
 async def tracker_loop():
-
-    await asyncio.sleep(
-        2
-    )
-
+    await asyncio.sleep(2)
 
     while not client.is_closed():
-
-        started = (
-            time.monotonic()
-        )
-
+        started = time.monotonic()
 
         try:
-
-            await run_presence_check(
-                "timer"
-            )
-
+            await run_presence_check("timer")
         except Exception as exc:
+            print(f"[Tracker] check failed: {exc}")
 
-            print(
-                "[Tracker] check failed: "
-                f"{exc}"
-            )
+        elapsed = time.monotonic() - started
+        wait = max(1, CHECK_INTERVAL - elapsed)
 
-
-        elapsed = (
-            time.monotonic()
-            - started
-        )
-
-
-        wait = max(
-            1,
-            CHECK_INTERVAL
-            - elapsed,
-        )
-
-
-        await asyncio.sleep(
-            wait
-        )
-
+        await asyncio.sleep(wait)
 
 # ============================================================
-# RENDER HEALTH SERVER
+# RENDER WEB SERVER
 # ============================================================
 
 web = FastAPI()
 
-
 @web.get("/")
 def root():
-
     return {
         "ok": True,
-
-        "service":
-            "Roblox Discord + Telegram "
-            "Presence Bot",
-
-        "discord":
-            (
-                str(client.user)
-                if client.user
-                else "connecting"
-            ),
-
-        "check_interval":
-            CHECK_INTERVAL,
+        "service": "Roblox Discord + Telegram Presence Bot",
+        "discord": (
+            str(client.user)
+            if client.user
+            else "connecting"
+        ),
+        "check_interval": CHECK_INTERVAL,
     }
-
 
 @web.get("/health")
 def health():
-
-    return {
-        "ok": True
-    }
-
+    return {"ok": True}
 
 def run_web_server():
-
     uvicorn.run(
         web,
         host="0.0.0.0",
@@ -2645,63 +1217,34 @@ def run_web_server():
         log_level="warning",
     )
 
-
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-
-    print(
-        "[Startup] preparing database..."
-    )
-
+    print("[Startup] preparing database...")
     init_db()
 
-
-    print(
-        "[Startup] starting "
-        "Render health server..."
-    )
-
+    print("[Startup] starting Render health server...")
     threading.Thread(
         target=run_web_server,
         daemon=True,
     ).start()
 
-
     async def runner():
+        loop = asyncio.get_running_loop()
 
-        loop = (
-            asyncio.get_running_loop()
-        )
-
-
-        print(
-            "[Startup] starting "
-            "Telegram polling..."
-        )
-
+        print("[Startup] starting Telegram polling...")
         threading.Thread(
             target=telegram_polling_loop,
             args=(loop,),
             daemon=True,
         ).start()
 
+        print("[Startup] connecting Discord...")
+        await client.start(DISCORD_BOT_TOKEN)
 
-        print(
-            "[Startup] connecting Discord..."
-        )
-
-        await client.start(
-            DISCORD_BOT_TOKEN
-        )
-
-
-    asyncio.run(
-        runner()
-    )
-
+    asyncio.run(runner())
 
 if __name__ == "__main__":
     main()
